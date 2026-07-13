@@ -7,6 +7,7 @@ const dec = new TextDecoder();
 function makeDeps(fetchImpl: typeof fetch, persistImpl?: (t: PersistTraceInput) => Promise<void>) {
   const persisted: PersistTraceInput[] = [];
   const scheduled: Promise<void>[] = [];
+  const stats: string[] = [];
   const deps: ProxyDeps = {
     fetchImpl,
     resolveKey: async (key: string) =>
@@ -17,11 +18,14 @@ function makeDeps(fetchImpl: typeof fetch, persistImpl?: (t: PersistTraceInput) 
       if (persistImpl) return persistImpl(t);
       persisted.push(t);
     },
+    bumpStat: async (_org, field) => {
+      stats.push(field);
+    },
     schedule: (work) => {
       scheduled.push(work()); // start immediately, like the real drain does
     },
   };
-  return { deps, persisted, settle: () => Promise.all(scheduled) };
+  return { deps, persisted, stats, settle: () => Promise.all(scheduled) };
 }
 
 function req(protocol: "anthropic" | "openai", body: unknown): Request {
@@ -82,6 +86,36 @@ describe("capture proxy", () => {
     // upstream got the swapped auth, not the client's hayek key
     const [, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit];
     expect((init.headers as Headers).get("authorization")).toBe("Bearer sk-real");
+  });
+
+  it("counts stream_started and stream_drained on a clean stream", async () => {
+    const chunks = ['data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', "data: [DONE]\n\n"];
+    const fetchImpl = vi.fn(async () => sse(chunks));
+    const { deps, stats, settle } = makeDeps(fetchImpl as unknown as typeof fetch);
+    const res = await handleProxy(req("openai", { stream: true }), "openai", deps);
+    await new Response(res.body).arrayBuffer(); // consume fully
+    await settle();
+    expect(stats).toContain("stream_started");
+    expect(stats).toContain("stream_drained");
+  });
+
+  it("counts stream_started but NOT stream_drained when the drain fails (the gap)", async () => {
+    const errStream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'));
+        c.error(new Error("client disconnected"));
+      },
+    });
+    const fetchImpl = vi.fn(
+      async () => new Response(errStream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const { deps, stats, settle } = makeDeps(fetchImpl as unknown as typeof fetch);
+    const res = await handleProxy(req("openai", { stream: true }), "openai", deps);
+    // don't read the client branch; let the capture drain hit the error
+    await settle().catch(() => {});
+    expect(stats).toContain("stream_started");
+    expect(stats).not.toContain("stream_drained");
+    void res;
   });
 
   it("delivers the first chunk before the upstream finishes (no full-buffering)", async () => {

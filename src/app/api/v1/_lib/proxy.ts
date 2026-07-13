@@ -46,6 +46,8 @@ export interface ProxyDeps {
   schedule: (work: () => Promise<void>) => void;
   /** Mark a key used. Best-effort. */
   touchKey?: (apiKeyId: string) => Promise<void>;
+  /** Count streaming captures started vs drained (disconnect-loss signal). */
+  bumpStat?: (orgId: string, field: "stream_started" | "stream_drained") => Promise<void>;
 }
 
 // Headers we must not copy back verbatim: fetch has already decoded the body,
@@ -152,6 +154,9 @@ export async function handleProxy(
   if (isStream && upstream.body) {
     // TEE: one branch to the client now, one to capture after close.
     const [clientStream, captureStream] = upstream.body.tee();
+    // Count the attempt on its own callback so it's recorded even if the drain
+    // below is cut short by a client disconnect — that gap is the whole point.
+    if (deps.bumpStat) deps.schedule(() => deps.bumpStat!(resolved.orgId, "stream_started").catch(() => {}));
     deps.schedule(async () => {
       try {
         const text = await drainToText(captureStream);
@@ -164,8 +169,10 @@ export async function handleProxy(
           tokensOut: ex.tokensOut,
           model: ex.model,
         });
+        if (deps.bumpStat) await deps.bumpStat(resolved.orgId, "stream_drained").catch(() => {});
       } catch {
-        // drain/parse failed — capture must not affect the client stream.
+        // drain/parse failed (e.g. client disconnected) — capture must not
+        // affect the client stream, and stream_drained stays un-incremented.
       }
     });
     return new Response(clientStream, { status, headers: passthroughHeaders(upstream.headers) });

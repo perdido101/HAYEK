@@ -1,6 +1,8 @@
 -- Adversarial RLS test. Runs entirely in one transaction, then rolls back.
 -- Proves: cross-org isolation, trace immutability, correction author-gating,
--- and create_org auth requirement. Any failure RAISEs and ON_ERROR_STOP aborts.
+-- create_org auth, AND eval-vault evidence immutability (runs/run_results are
+-- SELECT-only). Any failure RAISEs and ON_ERROR_STOP aborts. Every migration
+-- runs this — it is the product promise, executable.
 \set ON_ERROR_STOP on
 begin;
 
@@ -12,6 +14,9 @@ declare
   org_b  uuid;
   trace_a uuid;
   trace_b uuid;
+  suite_a uuid;
+  eval_a  uuid;
+  run_a   uuid;
   n int;
   ok boolean;
 begin
@@ -46,6 +51,16 @@ begin
   insert into public.traces (org_id, model, prompt_messages, output)
   values (org_b, 'gpt-4o', '[{"role":"user","content":"hi from beta"}]', 'beta out')
   returning id into trace_b;
+
+  -- eval-vault fixtures (service role): a suite + eval + run + result per org
+  insert into public.suites (org_id, name) values (org_a, 'Suite A') returning id into suite_a;
+  insert into public.evals (org_id, suite_id, name, input_messages)
+    values (org_a, suite_a, 'eval one', '[]'::jsonb) returning id into eval_a;
+  insert into public.runs (org_id, suite_id, model, adapter, pass_rate)
+    values (org_a, suite_a, 'claude-sonnet-5', 'anthropic', 1.0) returning id into run_a;
+  insert into public.run_results (run_id, org_id, eval_id, passed, score)
+    values (run_a, org_a, eval_a, true, 1.0);
+  insert into public.suites (org_id, name) values (org_b, 'Suite B');
 
   -- ---- switch to a non-superuser; RLS now applies -------------------------
   set local role authenticated;
@@ -96,6 +111,43 @@ begin
     raise exception 'FAIL: user A wrote a correction into org B';
   exception when insufficient_privilege or check_violation then
     raise notice 'PASS: cross-org correction write blocked';
+  end;
+
+  -- ---- EVAL VAULT (Phase 2) ----------------------------------------------
+  -- evals are org-scoped: user A sees own suite, not org B's
+  select count(*) into n from public.suites;
+  if n <> 1 then raise exception 'FAIL: user A sees % suites, expected 1', n; end if;
+  select count(*) into n from public.evals;
+  if n <> 1 then raise exception 'FAIL: user A sees % evals, expected 1', n; end if;
+  raise notice 'PASS: user A sees only own org suites/evals';
+
+  -- runs + run_results are readable evidence
+  select count(*) into n from public.runs;
+  if n <> 1 then raise exception 'FAIL: user A cannot read own runs (got %)', n; end if;
+  select count(*) into n from public.run_results;
+  if n <> 1 then raise exception 'FAIL: user A cannot read own run_results (got %)', n; end if;
+  raise notice 'PASS: user A can read runs + run_results (evidence)';
+
+  -- a member may author an eval
+  insert into public.evals (org_id, suite_id, name, input_messages)
+    values (org_a, suite_a, 'eval two', '[]'::jsonb);
+  raise notice 'PASS: member can author an eval';
+
+  -- runs/run_results are append-only evidence: no user INSERT/UPDATE/DELETE
+  begin
+    insert into public.runs (org_id, suite_id, model, adapter) values (org_a, suite_a, 'x', 'openai');
+    raise exception 'FAIL: run was INSERTable by app user';
+  exception when insufficient_privilege then raise notice 'PASS: run INSERT denied to app user';
+  end;
+  begin
+    update public.runs set pass_rate = 0 where id = run_a;
+    raise exception 'FAIL: run was UPDATEable by app user';
+  exception when insufficient_privilege then raise notice 'PASS: run UPDATE denied to app user';
+  end;
+  begin
+    delete from public.run_results where run_id = run_a;
+    raise exception 'FAIL: run_result was DELETEable by app user';
+  exception when insufficient_privilege then raise notice 'PASS: run_result DELETE denied to app user';
   end;
 
   -- === USER B ===

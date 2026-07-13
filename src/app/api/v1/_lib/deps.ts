@@ -78,12 +78,18 @@ async function touchKey(apiKeyId: string): Promise<void> {
   await admin.from("api_keys").update({ last_used_at: new Date().toISOString() }).eq("id", apiKeyId);
 }
 
+async function bumpStat(orgId: string, field: "stream_started" | "stream_drained"): Promise<void> {
+  const admin = createAdminClient();
+  await admin.rpc("bump_capture_stat", { p_org: orgId, p_field: field });
+}
+
 export function buildDeps(): ProxyDeps {
   return {
     fetchImpl: fetch,
     resolveKey,
     persistTrace,
     touchKey,
+    bumpStat,
     schedule: (work) => after(work),
   };
 }

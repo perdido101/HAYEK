@@ -7,3 +7,7 @@
 export * from "./trace/schema";
 export * from "./trace/cost";
 export * from "./capture/sse";
+export * from "./evals/types";
+export * from "./evals/jsonschema";
+export * from "./evals/assertions";
+export * from "./evals/runner";

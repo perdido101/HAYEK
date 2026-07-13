@@ -87,6 +87,12 @@ returns the provider response **byte-identical**, and captures a Trace.
 - **Org resolves only from `sha256(key)`** → a non-revoked `api_keys` row.
   Provider specifics live only in `/src/adapters`.
 
+**Known cost of the Edge choice:** if a client disconnects mid-stream, the
+background drain (`next/after`) can be cut short and that one trace is not
+captured — the client's call is never affected. We don't guess at how often:
+the proxy counts `stream_started` vs `stream_drained` per org in `capture_stats`,
+so the loss rate is an honest number, not a shrug.
+
 ## Develop
 
 ```bash
