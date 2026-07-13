@@ -21,18 +21,23 @@ CAPTURE → EVALS → ROUTER → DISTILL → AUDIT
 - Model adapters: Anthropic / OpenAI / any OpenAI-compatible base URL (`/src/adapters`)
 - Vitest
 
-## Architecture rule (sacred)
+## Architecture rules (sacred), enforced by guard tests
 
-`/src/core/**` is pure TypeScript — the trace schema, eval runner, scoring, and
-router policy. Zero framework imports, zero network. Everything depends on
-`core`; `core` depends on nothing. `tests/core-purity.test.ts` fails the build
-if `core` ever imports `next`, `react`, or `supabase`, or touches the network.
+- **`/src/core/**` is pure.** The trace schema, eval runner, scoring, router
+  policy — zero framework imports, zero network. Everything depends on `core`;
+  `core` depends on nothing. `tests/core-purity.test.ts` fails the build if
+  `core` imports `next`/`react`/`supabase` or touches the network.
+- **The service-role client is quarantined.** `src/server/admin.ts` bypasses
+  RLS, so it may be imported ONLY from the capture proxy under
+  `src/app/api/v1/**`. `tests/admin-quarantine.test.ts` fails the build on any
+  other importer.
 
 ## Layout
 
 ```
-src/core/            pure domain logic (trace schema, cost estimation)
-src/lib/supabase/    client (anon, RLS), server (SSR, RLS), admin (service role)
+src/core/            pure domain logic (trace schema, cost provenance)
+src/lib/supabase/    client (anon, RLS), server (SSR, RLS)
+src/server/admin.ts  service-role client — QUARANTINED to the proxy
 src/app/             Next.js App Router
 packages/sdk/        @hayek/sdk — wrapTrace(), logCorrection()
 supabase/migrations/ schema + RLS  (0001_init.sql)
@@ -42,10 +47,23 @@ tests/               guard tests
 ## The trust boundary (RLS)
 
 Every domain table is org-scoped. A single `SECURITY DEFINER` function,
-`is_org_member(org_id)`, backs every policy, so **no cross-org read is possible**.
-Orgs are created via the `create_org()` RPC (definer), which inserts the org and
-the caller's `owner` membership atomically — you cannot conjure an org you don't
-belong to. See `supabase/migrations/0001_init.sql`.
+`is_org_member(org_id)` (empty `search_path`, fully qualified), backs every
+policy, so **no cross-org read is possible**. Orgs are created via the
+`create_org()` RPC (definer), which inserts the org and the caller's `owner`
+membership atomically — you cannot conjure an org you don't belong to.
+
+**The proxy is the sharp edge.** `service_role` carries `BYPASSRLS`; `FORCE RLS`
+does not stop it. So the capture proxy resolves `org_id` **only** by hashing the
+presented API key and matching a non-revoked `api_keys` row — never from a
+header, body, or query the caller controls.
+
+**Traces are immutable.** Evals, the Choice grid, and the distill export all
+cite traces as evidence, so app users get a READ policy and nothing else — no
+UPDATE, no DELETE. Deletion is a retention job (service role), not a user.
+Corrections are many-per-trace with a `status` (`pending`/`accepted`/`rejected`)
+so Phase 4 knows which one is the answer; each is editable only by its author.
+
+See `supabase/migrations/0001_init.sql`.
 
 ## Develop
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { estimateCost } from "./cost";
+import { estimateCost, priceTrace, PRICE_TABLE_VERSION } from "./cost";
 import { TraceSchema, CorrectionSchema } from "./schema";
 
 describe("estimateCost", () => {
@@ -18,6 +18,24 @@ describe("estimateCost", () => {
   });
 });
 
+describe("priceTrace provenance", () => {
+  it("returns the exact rates and table version used", () => {
+    const p = priceTrace("claude-sonnet-5", 1000, 1000);
+    expect(p.rate_in).toBe(3);
+    expect(p.rate_out).toBe(15);
+    expect(p.price_table_version).toBe(PRICE_TABLE_VERSION);
+    expect(p.cost_estimate).toBeCloseTo(3 / 1e3 + 15 / 1e3, 9);
+  });
+
+  it("stamps the version but null rates for an unknown model", () => {
+    const p = priceTrace("mystery-model", 100, 100);
+    expect(p.cost_estimate).toBe(0);
+    expect(p.rate_in).toBeNull();
+    expect(p.rate_out).toBeNull();
+    expect(p.price_table_version).toBe(PRICE_TABLE_VERSION);
+  });
+});
+
 describe("domain schemas", () => {
   it("accepts a well-formed trace", () => {
     const parsed = TraceSchema.safeParse({
@@ -31,6 +49,9 @@ describe("domain schemas", () => {
       tokens_in: 3,
       tokens_out: 2,
       cost_estimate: 0.0001,
+      rate_in: 3,
+      rate_out: 15,
+      price_table_version: "2026-01",
       created_at: new Date(0).toISOString(),
     });
     expect(parsed.success).toBe(true);
@@ -38,12 +59,29 @@ describe("domain schemas", () => {
 
   it("rejects a correction with an out-of-range rating", () => {
     const parsed = CorrectionSchema.safeParse({
+      id: "00000000-0000-0000-0000-000000000003",
       trace_id: "00000000-0000-0000-0000-000000000001",
       org_id: "00000000-0000-0000-0000-000000000002",
       corrected_output: "fixed",
       rating: 9,
       reason: null,
       author: null,
+      status: "pending",
+      created_at: new Date(0).toISOString(),
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a correction with an unknown status", () => {
+    const parsed = CorrectionSchema.safeParse({
+      id: "00000000-0000-0000-0000-000000000003",
+      trace_id: "00000000-0000-0000-0000-000000000001",
+      org_id: "00000000-0000-0000-0000-000000000002",
+      corrected_output: "fixed",
+      rating: 4,
+      reason: null,
+      author: null,
+      status: "maybe",
       created_at: new Date(0).toISOString(),
     });
     expect(parsed.success).toBe(false);

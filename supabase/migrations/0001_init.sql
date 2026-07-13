@@ -1,9 +1,20 @@
 -- ============================================================================
 -- HAYEK — 0001_init
--- Foundation: tenancy (orgs + members) and Module 1 CAPTURE (tasks, traces,
--- corrections). RLS is the trust boundary. Every domain table is org-scoped
--- and NO cross-org read is possible. Later phases add their own migrations
--- (evals/suites/runs in 0002, route policies in 0003, ...).
+-- Foundation. RLS is the trust boundary: every domain table is org-scoped and
+-- NO cross-org read is possible. Cross-cutting concerns live HERE regardless of
+-- which phase first uses them — tenancy, api_keys, trace immutability, and the
+-- task FK — because deferring them means a data backfill, not a create table.
+-- Later, per-phase migrations add evals/suites/runs (0002), route policies, etc.
+--
+-- Two things this file takes seriously:
+--   1. The capture proxy uses the service_role key, which carries BYPASSRLS.
+--      FORCE RLS does not stop it. So the proxy must resolve org_id ONLY from a
+--      hashed api_key (below), never from caller-controlled input. That is the
+--      real boundary once the proxy runs.
+--   2. Traces are the ledger. Evals, the Choice grid, and the distill export
+--      all cite them as evidence, so they are IMMUTABLE to app users: no UPDATE
+--      or DELETE policy exists. Deletion is a retention job (service role), not
+--      a user action.
 -- ============================================================================
 
 create extension if not exists "pgcrypto";
@@ -12,23 +23,26 @@ create extension if not exists "pgcrypto";
 -- Enums
 -- ----------------------------------------------------------------------------
 create type org_role as enum ('owner', 'admin', 'member');
+create type correction_status as enum ('pending', 'accepted', 'rejected');
 
 -- ----------------------------------------------------------------------------
--- profiles — 1:1 mirror of auth.users, so we can show authors without
--- exposing the auth schema. Populated by a trigger on signup.
+-- profiles — 1:1 mirror of auth.users so we can show authors without exposing
+-- the auth schema. Populated by a trigger on signup.
 -- ----------------------------------------------------------------------------
 create table profiles (
-  id          uuid primary key references auth.users (id) on delete cascade,
-  email       text,
+  id           uuid primary key references auth.users (id) on delete cascade,
+  email        text,
   display_name text,
-  created_at  timestamptz not null default now()
+  created_at   timestamptz not null default now()
 );
 
+-- SECURITY DEFINER + empty search_path (prevents search_path hijack; all refs
+-- are schema-qualified). Flagged by Supabase's own linter otherwise.
 create or replace function handle_new_user()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 begin
   insert into public.profiles (id, email, display_name)
@@ -42,8 +56,8 @@ create trigger on_auth_user_created
   for each row execute function handle_new_user();
 
 -- ----------------------------------------------------------------------------
--- orgs + org_members — the tenant. A user sees data only for orgs they belong
--- to. This is enforced by is_org_member() below, referenced by every policy.
+-- orgs + org_members — the tenant. is_org_member() below is the single source
+-- of truth for "can this user touch this org's rows?" and backs every policy.
 -- ----------------------------------------------------------------------------
 create table orgs (
   id         uuid primary key default gen_random_uuid(),
@@ -61,15 +75,14 @@ create table org_members (
 
 create index org_members_user_idx on org_members (user_id);
 
--- SECURITY DEFINER membership check. Bypasses RLS on org_members (avoids
--- infinite policy recursion) and is the single source of truth for "can this
--- user touch this org's rows?". STABLE so the planner can cache per-statement.
+-- Bypasses RLS on org_members (avoids policy recursion) and is STABLE so the
+-- planner caches it per-statement. Empty search_path; fully qualified refs.
 create or replace function is_org_member(target_org uuid)
 returns boolean
 language sql
 security definer
 stable
-set search_path = public
+set search_path = ''
 as $$
   select exists (
     select 1 from public.org_members m
@@ -78,16 +91,16 @@ as $$
   );
 $$;
 
--- Atomic "create org + become owner". Runs as definer so the fresh org and
--- the caller's membership are inserted together before any RLS check applies.
+-- Atomic "create org + become owner". Definer so the fresh org and the caller's
+-- membership are inserted together before any RLS check applies.
 create or replace function create_org(org_name text)
-returns orgs
+returns public.orgs
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
-  new_org orgs;
+  new_org public.orgs;
 begin
   if auth.uid() is null then
     raise exception 'must be authenticated';
@@ -102,8 +115,27 @@ end;
 $$;
 
 -- ----------------------------------------------------------------------------
--- tasks — a named job the router will bind to an EvalSuite (Module 3).
--- Introduced here because traces reference a task.
+-- api_keys — the proxy's ONLY way to resolve an org. The plaintext key is shown
+-- to the customer once; we store sha256(key). The proxy hashes the presented
+-- key and looks up a non-revoked row. org_id comes from THIS row and nothing
+-- the caller can set. `prefix` (first chars) is for display/lookup only.
+-- ----------------------------------------------------------------------------
+create table api_keys (
+  id           uuid primary key default gen_random_uuid(),
+  org_id       uuid not null references orgs (id) on delete cascade,
+  key_hash     text not null unique,       -- hex sha256 of the plaintext key
+  prefix       text not null,              -- e.g. "hyk_live_a1b2" for display
+  name         text not null,
+  last_used_at timestamptz,
+  revoked_at   timestamptz,
+  created_at   timestamptz not null default now()
+);
+
+create index api_keys_org_idx on api_keys (org_id);
+
+-- ----------------------------------------------------------------------------
+-- tasks — a named job the router binds to an EvalSuite (Module 3). Here because
+-- traces reference it (deferring the FK would mean a backfill).
 -- ----------------------------------------------------------------------------
 create table tasks (
   id         uuid primary key default gen_random_uuid(),
@@ -116,93 +148,105 @@ create table tasks (
 create index tasks_org_idx on tasks (org_id);
 
 -- ----------------------------------------------------------------------------
--- traces — MODULE 1. One row per proxied model call. Written by the capture
--- proxy (service role); read by org members via RLS.
+-- traces — MODULE 1, the immutable ledger. Written by the proxy (service role);
+-- read by org members. Cost provenance (rate_in/out + price_table_version) is
+-- stored on the row so repricing the table never rewrites history.
 -- ----------------------------------------------------------------------------
 create table traces (
-  id              uuid primary key default gen_random_uuid(),
-  org_id          uuid not null references orgs (id) on delete cascade,
-  task_id         uuid references tasks (id) on delete set null,
-  model           text not null,
-  prompt_messages jsonb not null,
-  output          text,
-  latency_ms      integer,
-  tokens_in       integer,
-  tokens_out      integer,
-  cost_estimate   numeric(12, 6),
-  created_at      timestamptz not null default now()
+  id                  uuid primary key default gen_random_uuid(),
+  org_id              uuid not null references orgs (id) on delete cascade,
+  task_id             uuid references tasks (id) on delete set null,
+  model               text not null,
+  prompt_messages     jsonb not null,
+  output              text,
+  latency_ms          integer,
+  tokens_in           integer,
+  tokens_out          integer,
+  cost_estimate       numeric(12, 6),
+  rate_in             numeric(12, 6),   -- USD / 1M input tokens applied
+  rate_out            numeric(12, 6),   -- USD / 1M output tokens applied
+  price_table_version text,             -- which table produced the rates above
+  created_at          timestamptz not null default now()
 );
 
 create index traces_org_created_idx on traces (org_id, created_at desc);
-create index traces_task_idx on traces (task_id);
+create index traces_org_task_idx on traces (org_id, task_id);
 
 -- ----------------------------------------------------------------------------
--- corrections — MODULE 1's gold. A human's edit of a trace's output.
+-- corrections — MODULE 1's gold. MANY per trace: reviewers disagree, and Phase
+-- 4 needs to know which one is the answer. `status` resolves that — only
+-- `accepted` corrections are eligible for distillation.
 -- ----------------------------------------------------------------------------
 create table corrections (
-  trace_id         uuid primary key references traces (id) on delete cascade,
+  id               uuid primary key default gen_random_uuid(),
+  trace_id         uuid not null references traces (id) on delete cascade,
   org_id           uuid not null references orgs (id) on delete cascade,
   corrected_output text not null,
   rating           smallint not null check (rating between 1 and 5),
   reason           text,
   author           uuid references auth.users (id) on delete set null,
+  status           correction_status not null default 'pending',
   created_at       timestamptz not null default now()
 );
 
 create index corrections_org_created_idx on corrections (org_id, created_at desc);
+create index corrections_trace_idx on corrections (trace_id);
 
 -- ============================================================================
--- ROW LEVEL SECURITY
--- Default-deny: enable RLS, then grant exactly membership-scoped access.
--- FORCE so even the table owner is subject to policies.
+-- ROW LEVEL SECURITY — default-deny. Enable + FORCE (owner is subject too),
+-- then grant exactly membership-scoped access. Remember: service_role BYPASSES
+-- all of this; these policies govern the authenticated in-app path only.
 -- ============================================================================
 
--- profiles: a user reads/updates only their own row.
+-- profiles: self only.
 alter table profiles enable row level security;
 alter table profiles force row level security;
-
 create policy "profiles: self read"   on profiles for select using (id = auth.uid());
 create policy "profiles: self update" on profiles for update using (id = auth.uid()) with check (id = auth.uid());
 
--- orgs: visible only to members. Creation goes through create_org() (definer),
--- so there is no direct INSERT policy — you cannot conjure an org you don't own.
+-- orgs: visible to members. Creation is create_org() (definer) only — no direct
+-- INSERT policy, so you cannot conjure an org you don't belong to.
 alter table orgs enable row level security;
 alter table orgs force row level security;
+create policy "orgs: member read"  on orgs for select using (is_org_member(id));
+create policy "orgs: admin update" on orgs for update using (is_org_member(id)) with check (is_org_member(id));
 
-create policy "orgs: member read"   on orgs for select using (is_org_member(id));
-create policy "orgs: admin update"  on orgs for update using (is_org_member(id)) with check (is_org_member(id));
-
--- org_members: members can see the roster of their own orgs.
+-- org_members: members see their own orgs' roster.
 alter table org_members enable row level security;
 alter table org_members force row level security;
-
 create policy "org_members: member read" on org_members for select using (is_org_member(org_id));
+
+-- api_keys: members manage their org's keys. Revocation is an UPDATE
+-- (revoked_at); we never hard-delete a key. The plaintext is never stored.
+alter table api_keys enable row level security;
+alter table api_keys force row level security;
+create policy "api_keys: member read"   on api_keys for select using (is_org_member(org_id));
+create policy "api_keys: member write"  on api_keys for insert with check (is_org_member(org_id));
+create policy "api_keys: member revoke" on api_keys for update using (is_org_member(org_id)) with check (is_org_member(org_id));
 
 -- tasks: full CRUD scoped to membership.
 alter table tasks enable row level security;
 alter table tasks force row level security;
-
 create policy "tasks: member read"   on tasks for select using (is_org_member(org_id));
 create policy "tasks: member write"  on tasks for insert with check (is_org_member(org_id));
 create policy "tasks: member update" on tasks for update using (is_org_member(org_id)) with check (is_org_member(org_id));
 create policy "tasks: member delete" on tasks for delete using (is_org_member(org_id));
 
--- traces: members read; members may insert/update within their org (the proxy
--- uses the service role and bypasses RLS entirely, so these policies govern
--- only in-app access).
+-- traces: IMMUTABLE ledger. Members READ only. No insert (proxy uses service
+-- role), no update, no delete — provenance is not theatre.
 alter table traces enable row level security;
 alter table traces force row level security;
+create policy "traces: member read" on traces for select using (is_org_member(org_id));
 
-create policy "traces: member read"   on traces for select using (is_org_member(org_id));
-create policy "traces: member write"  on traces for insert with check (is_org_member(org_id));
-create policy "traces: member update" on traces for update using (is_org_member(org_id)) with check (is_org_member(org_id));
-create policy "traces: member delete" on traces for delete using (is_org_member(org_id));
-
--- corrections: members read/write within their org.
+-- corrections: any member may add one (author is forced to themselves, so
+-- provenance is honest). A correction may be edited or removed ONLY by its
+-- author. Status transitions are updates, also author-gated at this layer.
 alter table corrections enable row level security;
 alter table corrections force row level security;
-
-create policy "corrections: member read"   on corrections for select using (is_org_member(org_id));
-create policy "corrections: member write"  on corrections for insert with check (is_org_member(org_id));
-create policy "corrections: member update" on corrections for update using (is_org_member(org_id)) with check (is_org_member(org_id));
-create policy "corrections: member delete" on corrections for delete using (is_org_member(org_id));
+create policy "corrections: member read"  on corrections for select using (is_org_member(org_id));
+create policy "corrections: member write" on corrections for insert
+  with check (is_org_member(org_id) and author = auth.uid());
+create policy "corrections: author update" on corrections for update
+  using (author = auth.uid()) with check (author = auth.uid());
+create policy "corrections: author delete" on corrections for delete
+  using (author = auth.uid());

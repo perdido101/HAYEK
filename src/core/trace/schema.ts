@@ -26,6 +26,11 @@ export const TraceSchema = z.object({
   tokens_in: z.number().int().nonnegative().nullable(),
   tokens_out: z.number().int().nonnegative().nullable(),
   cost_estimate: z.number().nonnegative().nullable(),
+  // Cost provenance — the exact rates and table version used, so repricing the
+  // table never rewrites this trace's cost. Written by the proxy from priceTrace().
+  rate_in: z.number().nonnegative().nullable(),
+  rate_out: z.number().nonnegative().nullable(),
+  price_table_version: z.string().nullable(),
   created_at: z.string(),
 });
 export type Trace = z.infer<typeof TraceSchema>;
@@ -37,20 +42,32 @@ export type NewTrace = z.infer<typeof NewTraceSchema>;
 /**
  * A Correction is the gold: a human's edit of a Trace's output. First-class,
  * because this is the knowledge that would otherwise leak to the vendor.
+ *
+ * MANY corrections per trace — reviewers disagree, and Phase 4 needs to know
+ * which one is the answer. `status` resolves that: only `accepted` corrections
+ * are eligible for distillation.
  */
+export const CorrectionStatusSchema = z.enum(["pending", "accepted", "rejected"]);
+export type CorrectionStatus = z.infer<typeof CorrectionStatusSchema>;
+
 export const CorrectionSchema = z.object({
+  id: z.string().uuid(),
   trace_id: z.string().uuid(),
   org_id: z.string().uuid(),
   corrected_output: z.string().min(1),
   rating: z.number().int().min(1).max(5),
   reason: z.string().nullable(),
   author: z.string().uuid().nullable(),
+  status: CorrectionStatusSchema,
   created_at: z.string(),
 });
 export type Correction = z.infer<typeof CorrectionSchema>;
 
+/** Shape a reviewer submits — id/org/status/created_at are assigned server-side. */
 export const NewCorrectionSchema = CorrectionSchema.omit({
+  id: true,
   org_id: true,
+  status: true,
   created_at: true,
 }).extend({
   reason: z.string().nullable().default(null),
