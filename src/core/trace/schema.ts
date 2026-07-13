@@ -22,6 +22,9 @@ export const TraceSchema = z.object({
   model: z.string().min(1),
   prompt_messages: z.array(MessageSchema),
   output: z.string().nullable(),
+  // Upstream HTTP status. An error response (429, content-filter refusal) is
+  // captured too — it is arguably the most useful signal.
+  status_code: z.number().int().nullable(),
   latency_ms: z.number().int().nonnegative().nullable(),
   tokens_in: z.number().int().nonnegative().nullable(),
   tokens_out: z.number().int().nonnegative().nullable(),

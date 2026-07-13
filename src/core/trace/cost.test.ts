@@ -45,6 +45,7 @@ describe("domain schemas", () => {
       model: "claude-sonnet-5",
       prompt_messages: [{ role: "user", content: "hi" }],
       output: "hello",
+      status_code: 200,
       latency_ms: 120,
       tokens_in: 3,
       tokens_out: 2,

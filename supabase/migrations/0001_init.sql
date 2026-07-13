@@ -158,7 +158,8 @@ create table traces (
   task_id             uuid references tasks (id) on delete set null,
   model               text not null,
   prompt_messages     jsonb not null,
-  output              text,
+  output              text,             -- response body (success OR error body)
+  status_code         integer,         -- upstream HTTP status; a 429/refusal is signal too
   latency_ms          integer,
   tokens_in           integer,
   tokens_out          integer,
@@ -250,3 +251,31 @@ create policy "corrections: author update" on corrections for update
   using (author = auth.uid()) with check (author = auth.uid());
 create policy "corrections: author delete" on corrections for delete
   using (author = auth.uid());
+
+-- ============================================================================
+-- GRANTS — RLS filters rows, but a role still needs the table privilege first.
+-- These are explicit (not left to platform default privileges) so the boundary
+-- is reproducible across environments, not "works on my project".
+--
+--   authenticated : DML matching each table's policy surface (RLS constrains).
+--   service_role  : full DML (it BYPASSES RLS; this is the trusted proxy path).
+--   anon          : nothing — no anonymous access to tenant data.
+-- ============================================================================
+grant usage on schema public to authenticated, service_role;
+
+-- authenticated — scoped to what the policies above allow.
+grant select, update                 on profiles     to authenticated;
+grant select, update                 on orgs         to authenticated;
+grant select                         on org_members  to authenticated;
+grant select, insert, update         on api_keys     to authenticated;
+grant select, insert, update, delete on tasks        to authenticated;
+grant select                         on traces       to authenticated;  -- immutable ledger
+grant select, insert, update, delete on corrections  to authenticated;
+
+-- service_role — the proxy and background jobs. RLS does not apply to it.
+grant select, insert, update, delete
+  on profiles, orgs, org_members, api_keys, tasks, traces, corrections
+  to service_role;
+
+grant execute on function is_org_member(uuid) to authenticated, service_role;
+grant execute on function create_org(text)    to authenticated, service_role;

@@ -6,3 +6,4 @@
  */
 export * from "./trace/schema";
 export * from "./trace/cost";
+export * from "./capture/sse";
