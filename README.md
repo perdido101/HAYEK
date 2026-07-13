@@ -11,6 +11,13 @@ CAPTURE → EVALS → ROUTER → DISTILL → AUDIT
 
 ## Status
 
+**Phase 3 — ROUTER + CHOICE GRID.** `resolveModel` (pure) routes a task only to
+a model whose latest run is fresh and passing — and returns `null` rather than
+route to one that hasn't earned it. The proxy honours `x-hayek-task` (resolve →
+route → record provenance; never fails the call). The **Choice grid** answers
+"if we lost Anthropic *and* OpenAI tomorrow, which tasks still pass?" — a
+multi-select provider toggle and a banner that names the uncovered tasks.
+
 **Phase 2 — EVAL VAULT.** Corrections become evals; evals run against a per-org
 model registry; the **comparison table** (rows = evals, columns = models) is the
 buy screen. A failing cell walks back the provenance chain

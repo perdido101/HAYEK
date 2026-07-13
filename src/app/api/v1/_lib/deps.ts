@@ -2,8 +2,8 @@ import { after } from "next/server";
 import { createAdminClient } from "@/server/admin";
 import { sha256Hex } from "@/server/apikey";
 import { getAdapter } from "@/adapters";
-import { priceTrace } from "@/core";
-import type { ProxyDeps, ResolvedKey, PersistTraceInput } from "./proxy";
+import { priceTrace, resolveModel, type RoutePolicy, type RunEvidence } from "@/core";
+import type { ProxyDeps, ResolvedKey, PersistTraceInput, RouteOutcome } from "./proxy";
 
 /**
  * Real wiring for the capture proxy. This is the ONLY place the service-role
@@ -69,8 +69,87 @@ async function persistTrace(t: PersistTraceInput): Promise<void> {
     rate_in: pricing.rate_in,
     rate_out: pricing.rate_out,
     price_table_version: pricing.price_table_version,
+    routed_from: t.routing?.routedFrom ?? null,
+    routed_to: t.routing?.routedTo ?? null,
+    policy_id: t.routing?.policyId ?? null,
+    resolution_reason: t.routing?.resolutionReason ?? null,
+    unrouted_reason: t.routing?.unroutedReason ?? null,
   });
   if (error) throw error; // captureSafely swallows; surfaces in logs only
+}
+
+function median(xs: number[]): number | null {
+  const v = xs.filter((x) => x != null).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const mid = Math.floor(v.length / 2);
+  return v.length % 2 ? v[mid]! : Math.round((v[mid - 1]! + v[mid]!) / 2);
+}
+
+/**
+ * Resolve a task name to a routed model via the pure resolveModel over live run
+ * evidence. null => the task name is unknown to this org.
+ */
+async function resolveRoute(orgId: string, taskName: string): Promise<RouteOutcome | null> {
+  const admin = createAdminClient();
+
+  const { data: task } = await admin
+    .from("tasks")
+    .select("id")
+    .eq("org_id", orgId)
+    .eq("name", taskName)
+    .maybeSingle();
+  if (!task) return null;
+
+  const { data: policyRow } = await admin
+    .from("route_policies")
+    .select("id, candidates, strategy, pinned_model, min_pass_rate, freshness_days")
+    .eq("org_id", orgId)
+    .eq("task_id", task.id)
+    .maybeSingle();
+  if (!policyRow) return { policyId: null, model: null, reason: "no policy for task" };
+
+  const { data: suite } = await admin
+    .from("suites")
+    .select("id")
+    .eq("org_id", orgId)
+    .eq("task_id", task.id)
+    .maybeSingle();
+  if (!suite) return { policyId: policyRow.id as string, model: null, reason: "no suite bound to task" };
+
+  const { data: runRows } = await admin
+    .from("runs")
+    .select("id, model, pass_rate, cost, finished_at")
+    .eq("suite_id", suite.id)
+    .order("started_at", { ascending: false });
+  const runIds = (runRows ?? []).map((r) => r.id as string);
+  const { data: rr } = runIds.length
+    ? await admin.from("run_results").select("run_id, latency_ms").in("run_id", runIds)
+    : { data: [] };
+  const latByRun = new Map<string, number[]>();
+  for (const r of rr ?? []) {
+    const arr = latByRun.get(r.run_id as string) ?? [];
+    if (r.latency_ms != null) arr.push(r.latency_ms as number);
+    latByRun.set(r.run_id as string, arr);
+  }
+
+  const evidence: RunEvidence[] = (runRows ?? []).map((r) => ({
+    model: r.model as string,
+    passRate: (r.pass_rate as number) ?? 0,
+    cost: (r.cost as number) ?? 0,
+    medianLatencyMs: median(latByRun.get(r.id as string) ?? []),
+    finishedAt: (r.finished_at as string) ?? new Date(0).toISOString(),
+  }));
+
+  const policy: RoutePolicy = {
+    candidates: (policyRow.candidates ?? []) as RoutePolicy["candidates"],
+    strategy: policyRow.strategy as RoutePolicy["strategy"],
+    pinnedModel: (policyRow.pinned_model as string | null) ?? null,
+    minPassRate: (policyRow.min_pass_rate as number) ?? 1,
+    freshnessDays: (policyRow.freshness_days as number) ?? 30,
+  };
+
+  const resolution = resolveModel(policy, evidence, Date.now());
+  return { policyId: policyRow.id as string, model: resolution.model, reason: resolution.reason };
 }
 
 async function touchKey(apiKeyId: string): Promise<void> {
@@ -90,6 +169,7 @@ export function buildDeps(): ProxyDeps {
     persistTrace,
     touchKey,
     bumpStat,
+    resolveRoute,
     schedule: (work) => after(work),
   };
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveModel } from "./resolve";
+import { resolveModel, classifyRun } from "./resolve";
 import type { RoutePolicy, RunEvidence } from "./types";
 
 const NOW = Date.parse("2026-03-04T00:00:00Z");
@@ -22,6 +22,20 @@ const run = (model: string, over: Partial<RunEvidence> = {}): RunEvidence => ({
   medianLatencyMs: 100,
   finishedAt: daysAgo(1),
   ...over,
+});
+
+describe("classifyRun (the Choice grid states)", () => {
+  it("grey when never evaluated", () => {
+    expect(classifyRun(null, 0.8, 30, NOW)).toBe("grey");
+  });
+  it("red when the latest run fails, regardless of freshness", () => {
+    expect(classifyRun({ passRate: 0.3, finishedAt: daysAgo(1) }, 0.8, 30, NOW)).toBe("red");
+    expect(classifyRun({ passRate: 0.3, finishedAt: daysAgo(99) }, 0.8, 30, NOW)).toBe("red");
+  });
+  it("green when passing + fresh, amber when passing + stale", () => {
+    expect(classifyRun({ passRate: 1, finishedAt: daysAgo(5) }, 0.8, 30, NOW)).toBe("green");
+    expect(classifyRun({ passRate: 1, finishedAt: daysAgo(40) }, 0.8, 30, NOW)).toBe("amber");
+  });
 });
 
 describe("resolveModel — eligibility", () => {

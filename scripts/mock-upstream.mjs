@@ -5,11 +5,18 @@ import { createServer } from "node:http";
 
 const PORT = process.env.MOCK_PORT ? Number(process.env.MOCK_PORT) : 8787;
 
-// A capable model answers; a "weak" one hedges. Lets the comparison table show
-// real disagreement (one PASS, one FAIL) instead of a uniform grid.
+// Three capability tiers, so the Choice grid shows a realistic pattern:
+//   strong  answers everything (incl. JSON)      -> passes all tasks
+//   decent  answers prose, no structured output  -> passes some
+//   weak    hedges                               -> passes none
+function answerText(model) {
+  const m = model || "";
+  if (/weak|1b|hedge|small/i.test(m)) return "I'm not sure — maybe Lyon?";
+  if (/decent|oss|compat/i.test(m)) return "PARIS. SUMMARY: the ticket is about billing.";
+  return 'PARIS. SUMMARY: the ticket is about billing. {"ok": true}';
+}
 function wordsFor(model) {
-  if (/weak|small|old|1b|mini/i.test(model || "")) return ["I'm", " not", " sure", " —", " maybe", " Lyon?"];
-  return ["The", " capital", " of", " France", " is", " Paris."];
+  return answerText(model).match(/\S+\s*/g) || [answerText(model)];
 }
 
 function send(res, status, headers, body) {

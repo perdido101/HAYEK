@@ -187,6 +187,60 @@ describe("capture proxy", () => {
     await expect(settle()).resolves.not.toThrow();
   });
 
+  it("routes to the resolved model, rewrites the body, and records provenance", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }], usage: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const { deps, persisted, settle } = makeDeps(fetchMock as unknown as typeof fetch);
+    deps.resolveRoute = async () => ({ policyId: "pol-1", model: "claude-sonnet-5", reason: "cheapest_passing" });
+
+    const r = new Request("https://acme.hayek.app/v1/x", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer hyk_good", "x-hayek-task": "summarize" },
+      body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+    });
+    await handleProxy(r, "openai", deps);
+
+    // upstream received the ROUTED model in the body
+    const [, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(JSON.parse((init as RequestInit).body as string).model).toBe("claude-sonnet-5");
+
+    await settle();
+    expect(persisted[0]!.routing?.routedFrom).toBe("gpt-4o");
+    expect(persisted[0]!.routing?.routedTo).toBe("claude-sonnet-5");
+    expect(persisted[0]!.routing?.policyId).toBe("pol-1");
+  });
+
+  it("passes through unchanged and flags unrouted_reason when nothing qualifies (never fails the call)", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }], usage: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const { deps, persisted, settle } = makeDeps(fetchMock as unknown as typeof fetch);
+    deps.resolveRoute = async () => ({ policyId: "pol-1", model: null, reason: "no model currently qualifies for this task" });
+
+    const r = new Request("https://acme.hayek.app/v1/x", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer hyk_good", "x-hayek-task": "summarize" },
+      body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+    });
+    const res = await handleProxy(r, "openai", deps);
+    expect(res.status).toBe(200); // routing refusal NEVER fails the call
+
+    // body forwarded unchanged — no silent substitution
+    const [, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(JSON.parse((init as RequestInit).body as string).model).toBe("gpt-4o");
+
+    await settle();
+    expect(persisted[0]!.routing?.routedTo).toBeNull();
+    expect(persisted[0]!.routing?.unroutedReason).toMatch(/no model currently qualifies/);
+  });
+
   it("returns 502 and captures when the upstream is unreachable", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("ECONNREFUSED");

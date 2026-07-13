@@ -247,3 +247,33 @@ export async function promoteToEval(
   revalidatePath("/evals");
   return { suiteId, evalId: made.id as string };
 }
+
+// ---- router policy ---------------------------------------------------------
+export async function saveRoutePolicy(input: {
+  taskId: string;
+  strategy: "cheapest_passing" | "fastest_passing" | "pinned";
+  minPassRate: number;
+  freshnessDays: number;
+  pinnedModel?: string | null;
+  candidates: string[]; // model_id strings
+}): Promise<{ ok: true } | { error: string }> {
+  const org = await currentOrg();
+  if (!org) return { error: "not authenticated" };
+  const supabase = await createClient();
+  const { error } = await supabase.from("route_policies").upsert(
+    {
+      org_id: org.orgId,
+      task_id: input.taskId,
+      strategy: input.strategy,
+      min_pass_rate: input.minPassRate,
+      freshness_days: input.freshnessDays,
+      pinned_model: input.pinnedModel ?? null,
+      candidates: input.candidates.map((m) => ({ model: m })),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "org_id,task_id" },
+  );
+  if (error) return { error: error.message };
+  revalidatePath("/choice");
+  return { ok: true };
+}

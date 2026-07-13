@@ -99,93 +99,121 @@ async function main() {
     }
   }
 
-  // 5) model registry: one provider (openai wire -> mock) + two models
-  let { data: provider } = await admin
-    .from("model_providers")
-    .select("id")
-    .eq("org_id", org.id)
-    .eq("label", "Mock (demo)")
-    .maybeSingle();
-  if (!provider) {
-    ({ data: provider } = await admin
+  // 5) model registry: 3 providers -> mock, 4 models across capability tiers
+  const enc = await encryptSecret("mock-provider-key");
+  async function getOrCreateProvider(label, adapter) {
+    let { data } = await admin.from("model_providers").select("id").eq("org_id", org.id).eq("label", label).maybeSingle();
+    if (data) return data.id;
+    ({ data } = await admin
       .from("model_providers")
-      .insert({
-        org_id: org.id,
-        label: "Mock (demo)",
-        adapter: "openai",
-        base_url: MOCK,
-        api_key_encrypted: await encryptSecret("mock-provider-key"),
-      })
+      .insert({ org_id: org.id, label, adapter, base_url: MOCK, api_key_encrypted: enc })
       .select("id")
       .single());
+    return data.id;
   }
-  for (const m of ["mock-gpt", "mock-weak-1b"]) {
-    const { data: exists } = await admin
+  const pAnthropic = await getOrCreateProvider("Anthropic", "anthropic");
+  const pOpenAI = await getOrCreateProvider("OpenAI", "openai");
+  const pVllm = await getOrCreateProvider("Self-hosted (vLLM)", "openai_compatible");
+  const modelDefs = [
+    { model_id: "claude-strong", provider: pAnthropic, adapter: "anthropic" },
+    { model_id: "gpt-strong", provider: pOpenAI, adapter: "openai" },
+    { model_id: "oss-decent", provider: pVllm, adapter: "openai_compatible" },
+    { model_id: "oss-weak-1b", provider: pVllm, adapter: "openai_compatible" },
+  ];
+  for (const m of modelDefs) {
+    const { data: ex } = await admin
       .from("models")
       .select("id")
-      .eq("provider_id", provider.id)
-      .eq("model_id", m)
+      .eq("provider_id", m.provider)
+      .eq("model_id", m.model_id)
       .maybeSingle();
-    if (!exists) await admin.from("models").insert({ org_id: org.id, provider_id: provider.id, model_id: m, label: m });
+    if (!ex) await admin.from("models").insert({ org_id: org.id, provider_id: m.provider, model_id: m.model_id, label: m.model_id });
   }
 
-  // 6) provenance chain: a trace, a human correction, an eval promoted from it
-  const { data: existingEval } = await admin
-    .from("evals")
-    .select("id")
-    .eq("org_id", org.id)
-    .eq("name", "What is the capital of France?")
-    .maybeSingle();
-  if (!existingEval) {
-    const { data: trace } = await admin
-      .from("traces")
-      .insert({
+  // 6) tasks + suites + evals + runs + policies (idempotent on the first task)
+  const taskDefs = [
+    { task: "capital-of-france", suite: "Capital", question: "What is the capital of France?", assertion: "PARIS", provenance: true },
+    { task: "summarize-ticket", suite: "Summarize", question: "Summarize this support ticket.", assertion: "SUMMARY" },
+    { task: "extract-json", suite: "Extract JSON", question: 'Return {"ok": true} as JSON.', assertion: '"ok"' },
+  ];
+  const { data: already } = await admin.from("tasks").select("id").eq("org_id", org.id).eq("name", "capital-of-france").maybeSingle();
+  if (!already) {
+    // fetch each model's answer from the mock once
+    const answer = {};
+    for (const m of modelDefs) {
+      const res = await fetch(`${MOCK}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: m.model_id }),
+      });
+      const j = await res.json();
+      answer[m.model_id] = j.choices[0].message.content;
+    }
+    const latency = { "claude-strong": 220, "gpt-strong": 210, "oss-decent": 150, "oss-weak-1b": 90 };
+    const nowIso = new Date().toISOString();
+
+    for (const td of taskDefs) {
+      const { data: task } = await admin.from("tasks").insert({ org_id: org.id, name: td.task }).select("id").single();
+      const { data: suite } = await admin.from("suites").insert({ org_id: org.id, name: td.suite, task_id: task.id }).select("id").single();
+
+      let sourceCorrectionId = null;
+      if (td.provenance) {
+        const { data: trace } = await admin
+          .from("traces")
+          .insert({ org_id: org.id, model: "oss-weak-1b", prompt_messages: [{ role: "user", content: td.question }], output: "I'm not sure — maybe Lyon?", status_code: 200, tokens_in: 9, tokens_out: 6 })
+          .select("id")
+          .single();
+        const { data: corr } = await admin
+          .from("corrections")
+          .insert({ org_id: org.id, trace_id: trace.id, corrected_output: "The capital of France is PARIS.", rating: 2, reason: "The model hedged instead of answering a simple factual question.", author: userId, status: "accepted" })
+          .select("id")
+          .single();
+        sourceCorrectionId = corr.id;
+      }
+
+      const { data: ev } = await admin
+        .from("evals")
+        .insert({ org_id: org.id, suite_id: suite.id, name: td.question, input_messages: [{ role: "user", content: td.question }], expected_behavior: `Answer should contain ${td.assertion}`, assertions: [{ type: "contains", value: td.assertion }], tags: ["seed"], source_correction_id: sourceCorrectionId })
+        .select("id")
+        .single();
+
+      for (const m of modelDefs) {
+        const out = answer[m.model_id];
+        const passed = out.includes(td.assertion);
+        const { data: run } = await admin
+          .from("runs")
+          .insert({ org_id: org.id, suite_id: suite.id, model: m.model_id, adapter: m.adapter, started_at: nowIso, finished_at: nowIso, pass_rate: passed ? 1 : 0, cost: 0, price_table_version: "2026-01" })
+          .select("id")
+          .single();
+        await admin.from("run_results").insert({
+          run_id: run.id,
+          org_id: org.id,
+          eval_id: ev.id,
+          passed,
+          score: passed ? 1 : 0,
+          output: out,
+          latency_ms: latency[m.model_id],
+          assertion_results: [{ type: "contains", passed, score: passed ? 1 : 0, reason: `${passed ? "contains" : "missing"} ${td.assertion}` }],
+        });
+      }
+
+      await admin.from("route_policies").insert({
         org_id: org.id,
-        model: "mock-weak-1b",
-        prompt_messages: [{ role: "user", content: "What is the capital of France?" }],
-        output: "I'm not sure — maybe Lyon?",
-        status_code: 200,
-        tokens_in: 9,
-        tokens_out: 6,
-      })
-      .select("id")
-      .single();
-    const { data: correction } = await admin
-      .from("corrections")
-      .insert({
-        org_id: org.id,
-        trace_id: trace.id,
-        corrected_output: "The capital of France is Paris.",
-        rating: 2,
-        reason: "The model hedged instead of answering a simple factual question.",
-        author: userId,
-        status: "accepted",
-      })
-      .select("id")
-      .single();
-    const { data: suite } = await admin
-      .from("suites")
-      .insert({ org_id: org.id, name: "Geography" })
-      .select("id")
-      .single();
-    await admin.from("evals").insert({
-      org_id: org.id,
-      suite_id: suite.id,
-      name: "What is the capital of France?",
-      input_messages: [{ role: "user", content: "What is the capital of France?" }],
-      expected_behavior: "Answer with the correct capital, Paris.",
-      assertions: [{ type: "contains", value: "Paris" }],
-      tags: ["promoted"],
-      source_correction_id: correction.id,
-    });
+        task_id: task.id,
+        candidates: modelDefs.map((m) => ({ model: m.model_id })),
+        strategy: "cheapest_passing",
+        min_pass_rate: 0.8,
+        freshness_days: 30,
+      });
+    }
   }
 
   console.log("Seeded demo org 'Acme (demo)'.");
   console.log(`  login:  ${DEMO_EMAIL} / ${DEMO_PASSWORD}`);
   console.log(`  key:    ${DEMO_KEY}`);
-  console.log(`  upstream -> ${MOCK}`);
-  console.log(`  models: mock-gpt (answers), mock-weak-1b (hedges) -> ${MOCK}`);
-  console.log(`  suite 'Geography' with 1 eval promoted from a correction`);
+  console.log(`  providers: Anthropic, OpenAI, Self-hosted (vLLM) -> ${MOCK}`);
+  console.log(`  models: claude-strong, gpt-strong, oss-decent, oss-weak-1b`);
+  console.log(`  3 tasks with suites/evals/runs + route policies (x-hayek-task ready)`);
 }
 
 main().catch((e) => {

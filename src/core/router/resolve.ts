@@ -9,6 +9,32 @@ import type {
 const DAY_MS = 86_400_000;
 
 /**
+ * The Choice grid's four states, computed from a model's LATEST run — NOT from
+ * traces. An org's exposure (a task with no green model) is visible even if
+ * nobody called that task today.
+ *   green  passing + fresh   (eligible to route)
+ *   amber  passing but stale (needs a re-run before you'd trust it)
+ *   red    failing           (fresh or not — it failed)
+ *   grey   never evaluated
+ */
+export type CellStatus = "green" | "amber" | "red" | "grey";
+
+export function classifyRun(
+  latest: { passRate: number; finishedAt: string } | null,
+  minPassRate: number,
+  freshnessDays: number,
+  nowMs: number,
+): CellStatus {
+  if (!latest) return "grey";
+  if (latest.passRate < minPassRate) return "red";
+  const ageDays = (nowMs - Date.parse(latest.finishedAt)) / DAY_MS;
+  return ageDays <= freshnessDays ? "green" : "amber";
+}
+
+/** green is the only status eligible to route — matches resolveModel(). */
+export const isCovered = (s: CellStatus): boolean => s === "green";
+
+/**
  * resolveModel — the arbiter. Given a task's policy and the run evidence for
  * that task's suite, decide which model to route to.
  *
