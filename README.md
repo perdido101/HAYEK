@@ -11,10 +11,13 @@ CAPTURE → EVALS → ROUTER → DISTILL → AUDIT
 
 ## Status
 
-**Phase 1 — CAPTURE, working end to end.** The drop-in proxy (streaming +
-non-stream, byte-identical passthrough, capture-safe), the SDK trace/correction
-endpoints, the trace list, and the correction inbox. Built on Phase 0's
-validated schema + RLS + pure `core/` domain.
+**Phase 2 — EVAL VAULT.** Corrections become evals; evals run against a per-org
+model registry; the **comparison table** (rows = evals, columns = models) is the
+buy screen. A failing cell walks back the provenance chain
+`run_result → eval → correction → trace` — "this model fails because a reviewer
+corrected it, and here's what they wrote." The eval runner lives in
+`core/evals` (pure, injected judge). Built on Phase 1 CAPTURE (the drop-in
+proxy, SDK endpoints, correction inbox) and Phase 0's validated schema + RLS.
 
 ## Stack
 

@@ -29,6 +29,13 @@ export const openaiAdapter: ProviderAdapter = {
     return { name: "authorization", value: `Bearer ${upstreamKey}` };
   },
 
+  buildRequest(model, messages) {
+    return {
+      path: "/v1/chat/completions",
+      body: { model, stream: false, messages },
+    };
+  },
+
   readRequest(body): RequestFacts {
     const json = tryParseJSON<{
       model?: string;

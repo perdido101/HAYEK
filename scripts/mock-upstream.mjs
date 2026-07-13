@@ -4,7 +4,13 @@
 import { createServer } from "node:http";
 
 const PORT = process.env.MOCK_PORT ? Number(process.env.MOCK_PORT) : 8787;
-const WORDS = ["Hello", " from", " HAYEK", " —", " your", " exhaust,", " retained."];
+
+// A capable model answers; a "weak" one hedges. Lets the comparison table show
+// real disagreement (one PASS, one FAIL) instead of a uniform grid.
+function wordsFor(model) {
+  if (/weak|small|old|1b|mini/i.test(model || "")) return ["I'm", " not", " sure", " —", " maybe", " Lyon?"];
+  return ["The", " capital", " of", " France", " is", " Paris."];
+}
 
 function send(res, status, headers, body) {
   res.writeHead(status, headers);
@@ -20,20 +26,21 @@ async function streamSSE(res, frames) {
   res.end();
 }
 
-function openaiChunks() {
+function openaiChunks(words) {
   const id = "chatcmpl-mock";
-  const frames = WORDS.map(
+  const frames = words.map(
     (w) =>
       `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-gpt", choices: [{ index: 0, delta: { content: w } }] })}\n\n`,
   );
   frames.push(
-    `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: WORDS.length, total_tokens: 9 + WORDS.length } })}\n\n`,
+    `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: words.length, total_tokens: 9 + words.length } })}\n\n`,
   );
   frames.push("data: [DONE]\n\n");
   return frames;
 }
 
-function anthropicFrames() {
+function anthropicFrames(words) {
+  const WORDS = words;
   const f = [];
   f.push(
     `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_mock", model: "mock-claude", usage: { input_tokens: 11, output_tokens: 1 } } })}\n\n`,
@@ -59,10 +66,11 @@ const server = createServer((req, res) => {
   req.on("data", (c) => (raw += c));
   req.on("end", async () => {
     const body = raw ? JSON.parse(raw) : {};
-    const text = WORDS.join("");
+    const words = wordsFor(body.model);
+    const text = words.join("");
 
     if (req.url?.startsWith("/v1/chat/completions")) {
-      if (body.stream) return streamSSE(res, openaiChunks());
+      if (body.stream) return streamSSE(res, openaiChunks(words));
       return send(res, 200, { "content-type": "application/json" }, JSON.stringify({
         id: "chatcmpl-mock",
         object: "chat.completion",
@@ -73,7 +81,7 @@ const server = createServer((req, res) => {
     }
 
     if (req.url?.startsWith("/v1/messages")) {
-      if (body.stream) return streamSSE(res, anthropicFrames());
+      if (body.stream) return streamSSE(res, anthropicFrames(words));
       return send(res, 200, { "content-type": "application/json" }, JSON.stringify({
         id: "msg_mock",
         type: "message",

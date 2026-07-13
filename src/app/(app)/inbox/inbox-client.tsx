@@ -3,7 +3,7 @@
 import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Badge, Button, Card, Input } from "@/components/ui";
-import { saveCorrection } from "../actions";
+import { saveCorrection, promoteToEval } from "../actions";
 
 export interface TraceListItem {
   id: string;
@@ -66,10 +66,12 @@ export function Inbox({ traces, selected }: { traces: TraceListItem[]; selected:
 }
 
 function Editor({ trace, onSaved }: { trace: SelectedTrace; onSaved: () => void }) {
+  const router = useRouter();
   const [draft, setDraft] = useState(trace.output);
   const [rating, setRating] = useState<number | null>(null);
   const [reason, setReason] = useState("");
   const [status, setStatus] = useState<"idle" | "saved" | "error">("idle");
+  const [correctionId, setCorrectionId] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
   useEffect(() => {
@@ -77,6 +79,7 @@ function Editor({ trace, onSaved }: { trace: SelectedTrace; onSaved: () => void 
     setRating(null);
     setReason("");
     setStatus("idle");
+    setCorrectionId(null);
   }, [trace.id, trace.output]);
 
   function save() {
@@ -90,8 +93,25 @@ function Editor({ trace, onSaved }: { trace: SelectedTrace; onSaved: () => void 
       if ("error" in res) setStatus("error");
       else {
         setStatus("saved");
+        setCorrectionId(res.id);
         onSaved();
       }
+    });
+  }
+
+  function promote() {
+    startTransition(async () => {
+      // save first if needed, then promote — near-free, at most two clicks.
+      let id = correctionId;
+      if (!id) {
+        const res = await saveCorrection({ traceId: trace.id, correctedOutput: draft, rating, reason: reason || null });
+        if ("error" in res) return setStatus("error");
+        id = res.id;
+        setCorrectionId(id);
+      }
+      const res = await promoteToEval(id);
+      if ("error" in res) setStatus("error");
+      else router.push(`/evals/${res.suiteId}`);
     });
   }
 
@@ -115,6 +135,9 @@ function Editor({ trace, onSaved }: { trace: SelectedTrace; onSaved: () => void 
           {status === "saved" && <Badge tone="pass">correction saved</Badge>}
           {status === "error" && <Badge tone="fail">save failed</Badge>}
           <span className="hidden text-xs text-muted-foreground sm:inline">⌘↵ to save</span>
+          <Button onClick={promote} disabled={pending || !draft.trim()} title="save + create an eval from this correction">
+            Promote to eval →
+          </Button>
           <Button variant="pass" onClick={save} disabled={pending || !draft.trim()}>
             {pending ? "saving…" : "Save correction"}
           </Button>

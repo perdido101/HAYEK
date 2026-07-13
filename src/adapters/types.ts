@@ -30,6 +30,14 @@ export interface ProviderAdapter {
   upstreamPath: string;
   /** Header carrying the upstream credential (swapped in by the proxy). */
   authHeader(upstreamKey: string): { name: string; value: string };
+  /**
+   * Build a non-streaming request to invoke a model directly (the eval runner
+   * calls models this way). Returns the path (appended to base_url) and body.
+   */
+  buildRequest(
+    model: string,
+    messages: { role: string; content: string }[],
+  ): { path: string; body: unknown };
   /** Header names to strip from the client request before forwarding. */
   stripRequestHeaders: string[];
   /** Read model/messages/stream off the raw request body (best-effort). */

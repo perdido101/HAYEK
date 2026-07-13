@@ -17,8 +17,10 @@ declare
   suite_a uuid;
   eval_a  uuid;
   run_a   uuid;
+  provider_a uuid;
   n int;
   ok boolean;
+  secret text;
 begin
   -- ---- privileged setup (superuser) ---------------------------------------
   insert into auth.users (id, aud, role, email, created_at, updated_at)
@@ -61,6 +63,11 @@ begin
   insert into public.run_results (run_id, org_id, eval_id, passed, score)
     values (run_a, org_a, eval_a, true, 1.0);
   insert into public.suites (org_id, name) values (org_b, 'Suite B');
+
+  -- model registry: a provider with an (opaque) encrypted key, for org_a
+  insert into public.model_providers (org_id, label, adapter, api_key_encrypted)
+    values (org_a, 'OpenAI', 'openai', 'ZW5jcnlwdGVkLXNlY3JldA==') returning id into provider_a;
+  insert into public.models (org_id, provider_id, model_id) values (org_a, provider_a, 'gpt-4o');
 
   -- ---- switch to a non-superuser; RLS now applies -------------------------
   set local role authenticated;
@@ -149,6 +156,21 @@ begin
     raise exception 'FAIL: run_result was DELETEable by app user';
   exception when insufficient_privilege then raise notice 'PASS: run_result DELETE denied to app user';
   end;
+
+  -- ---- MODEL REGISTRY (Phase 2b) -----------------------------------------
+  -- the encrypted provider key is NOT readable by an app user (column grant)
+  begin
+    select api_key_encrypted into secret from public.model_providers where id = provider_a;
+    raise exception 'FAIL: app user read the encrypted provider key';
+  exception when insufficient_privilege then raise notice 'PASS: provider secret hidden from app user';
+  end;
+
+  -- but the key-less view and the models list ARE readable (org-scoped)
+  select count(*) into n from public.model_providers_public;
+  if n <> 1 then raise exception 'FAIL: user A cannot read own providers via view (got %)', n; end if;
+  select count(*) into n from public.models;
+  if n <> 1 then raise exception 'FAIL: user A cannot read own models (got %)', n; end if;
+  raise notice 'PASS: provider metadata + models readable (org-scoped), secret withheld';
 
   -- === USER B ===
   perform set_config('request.jwt.claims', json_build_object('sub', user_b, 'role', 'authenticated')::text, true);

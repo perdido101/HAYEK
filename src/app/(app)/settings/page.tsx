@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { Badge, Card } from "@/components/ui";
 import { KeyManager } from "./key-manager";
+import { ModelRegistry } from "./model-registry";
 
 export const dynamic = "force-dynamic";
 
@@ -13,9 +14,38 @@ export default async function SettingsPage() {
   const { data: upstreams } = await supabase
     .from("upstreams_public")
     .select("id, provider, base_url, is_default");
+  const { data: providers } = await supabase
+    .from("model_providers_public")
+    .select("id, label, adapter, base_url")
+    .order("created_at", { ascending: true });
+  const { data: models } = await supabase.from("models").select("id, provider_id, model_id, label");
 
   return (
     <div className="flex max-w-3xl flex-col gap-8">
+      <section className="flex flex-col gap-3">
+        <div>
+          <h1 className="text-lg font-semibold tracking-tight">Model registry</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            The models your comparison table runs against — your own API keys or any
+            OpenAI-compatible endpoint (vLLM, Ollama, an open model). Keys are encrypted at rest.
+          </p>
+        </div>
+        <ModelRegistry
+          providers={(providers ?? []).map((p) => ({
+            id: p.id as string,
+            label: p.label as string,
+            adapter: p.adapter as string,
+            baseUrl: (p.base_url as string) ?? null,
+          }))}
+          models={(models ?? []).map((m) => ({
+            id: m.id as string,
+            providerId: m.provider_id as string,
+            modelId: m.model_id as string,
+            label: (m.label as string) ?? (m.model_id as string),
+          }))}
+        />
+      </section>
+
       <section className="flex flex-col gap-3">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">API keys</h1>

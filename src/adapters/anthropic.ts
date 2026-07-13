@@ -29,6 +29,24 @@ export const anthropicAdapter: ProviderAdapter = {
     return { name: "x-api-key", value: upstreamKey };
   },
 
+  buildRequest(model, messages) {
+    // Anthropic takes `system` at the top level, not as a message role.
+    const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
+    const rest = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+    return {
+      path: "/v1/messages",
+      body: {
+        model,
+        max_tokens: 1024,
+        stream: false,
+        ...(system ? { system } : {}),
+        messages: rest.length ? rest : [{ role: "user", content: "" }],
+      },
+    };
+  },
+
   readRequest(body): RequestFacts {
     const json = tryParseJSON<{
       model?: string;
