@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * HAYEK — the vault. Instrument panel / ledger / archive.
+ * Dark by default, hairline borders, restrained color. Two semantic accents:
+ * --pass and --fail. No gradients.
+ */
+:root {
+  --background: 220 18% 7%;
+  --foreground: 210 12% 88%;
+  --panel: 220 16% 10%;
+  --muted: 220 12% 16%;
+  --muted-foreground: 215 10% 55%;
+  --border: 216 14% 18%;
+  --input: 216 14% 18%;
+  --ring: 210 12% 40%;
+  --accent: 200 90% 55%;
+  --accent-foreground: 220 18% 7%;
+  --pass: 152 58% 45%;
+  --fail: 8 72% 56%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-feature-settings: "tnum" 1, "ss01" 1;
+}
+
+/* Ledger numerals: tabular, monospace, everywhere numbers matter. */
+.num {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
