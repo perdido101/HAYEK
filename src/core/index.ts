@@ -11,3 +11,5 @@ export * from "./evals/types";
 export * from "./evals/jsonschema";
 export * from "./evals/assertions";
 export * from "./evals/runner";
+export * from "./router/types";
+export * from "./router/resolve";

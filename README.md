@@ -96,6 +96,14 @@ captured — the client's call is never affected. We don't guess at how often:
 the proxy counts `stream_started` vs `stream_drained` per org in `capture_stats`,
 so the loss rate is an honest number, not a shrug.
 
+## Security follow-ups (before anyone external sees this)
+
+- **Encrypt `upstreams.api_key`.** The Phase-2b model registry encrypts provider
+  secrets at rest (AES-256-GCM); the Phase-1 `upstreams` capture-forwarding key
+  is still plaintext. That asymmetry is the first thing a reviewer finds — bring
+  `upstreams` onto `src/server/crypto.ts` (touches the proxy's `resolveKey`, so
+  scheduled deliberately, not skipped).
+
 ## Develop
 
 ```bash

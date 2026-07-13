@@ -18,6 +18,7 @@ declare
   eval_a  uuid;
   run_a   uuid;
   provider_a uuid;
+  task_a uuid;
   n int;
   ok boolean;
   secret text;
@@ -68,6 +69,11 @@ begin
   insert into public.model_providers (org_id, label, adapter, api_key_encrypted)
     values (org_a, 'OpenAI', 'openai', 'ZW5jcnlwdGVkLXNlY3JldA==') returning id into provider_a;
   insert into public.models (org_id, provider_id, model_id) values (org_a, provider_a, 'gpt-4o');
+
+  -- a task + route policy for org_a (router config)
+  insert into public.tasks (org_id, name) values (org_a, 'summarize-ticket') returning id into task_a;
+  insert into public.route_policies (org_id, task_id, candidates, strategy, min_pass_rate)
+    values (org_a, task_a, '[{"model":"gpt-4o"}]'::jsonb, 'cheapest_passing', 0.8);
 
   -- ---- switch to a non-superuser; RLS now applies -------------------------
   set local role authenticated;
@@ -172,12 +178,25 @@ begin
   if n <> 1 then raise exception 'FAIL: user A cannot read own models (got %)', n; end if;
   raise notice 'PASS: provider metadata + models readable (org-scoped), secret withheld';
 
+  -- ---- ROUTER (Phase 3) --------------------------------------------------
+  -- route policies are member-CRUD, org-scoped
+  select count(*) into n from public.route_policies;
+  if n <> 1 then raise exception 'FAIL: user A sees % route policies, expected 1', n; end if;
+  update public.route_policies set min_pass_rate = 0.9 where task_id = task_a;
+  get diagnostics n = row_count;
+  if n <> 1 then raise exception 'FAIL: user A could not update own route policy'; end if;
+  raise notice 'PASS: route policy readable + editable by member';
+
   -- === USER B ===
   perform set_config('request.jwt.claims', json_build_object('sub', user_b, 'role', 'authenticated')::text, true);
 
   select count(*) into n from public.corrections;
   if n <> 0 then raise exception 'FAIL: user B saw % corrections from org A', n; end if;
   raise notice 'PASS: user B sees none of org A corrections';
+
+  select count(*) into n from public.route_policies;
+  if n <> 0 then raise exception 'FAIL: user B saw % route policies from org A', n; end if;
+  raise notice 'PASS: user B sees none of org A route policies';
 
   -- user B cannot edit user A's correction (author gate)
   update public.corrections set corrected_output = 'hijacked' where trace_id = trace_a;
