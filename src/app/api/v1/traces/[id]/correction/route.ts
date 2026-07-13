@@ -1,6 +1,6 @@
 import { createAdminClient, orgFromRequest, asUuidOrNull } from "../../../_lib/sdk";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
 /**

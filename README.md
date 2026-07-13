@@ -11,8 +11,10 @@ CAPTURE → EVALS → ROUTER → DISTILL → AUDIT
 
 ## Status
 
-**Phase 0 — foundation.** Scaffold, Supabase schema + RLS, org model, the pure
-`core/` domain, and the architecture guard test. UI comes in Phase 1.
+**Phase 1 — CAPTURE, working end to end.** The drop-in proxy (streaming +
+non-stream, byte-identical passthrough, capture-safe), the SDK trace/correction
+endpoints, the trace list, and the correction inbox. Built on Phase 0's
+validated schema + RLS + pure `core/` domain.
 
 ## Stack
 
@@ -35,13 +37,17 @@ CAPTURE → EVALS → ROUTER → DISTILL → AUDIT
 ## Layout
 
 ```
-src/core/            pure domain logic (trace schema, cost provenance)
+src/core/            pure domain logic (trace schema, cost provenance, SSE framing)
+src/adapters/        the ONLY place a provider's wire details live (anthropic, openai)
+src/app/api/v1/      the capture proxy + SDK endpoints (edge)
+src/app/(app)/       dashboard, traces, inbox, settings (auth-gated)
 src/lib/supabase/    client (anon, RLS), server (SSR, RLS)
 src/server/admin.ts  service-role client — QUARANTINED to the proxy
-src/app/             Next.js App Router
 packages/sdk/        @hayek/sdk — wrapTrace(), logCorrection()
-supabase/migrations/ schema + RLS  (0001_init.sql)
-tests/               guard tests
+supabase/migrations/ schema + RLS  (0001_init, 0002_capture)
+supabase/tests/      rls_boundary.sql — adversarial cross-org/immutability proof
+scripts/             mock-upstream + seed-demo (local loop demo)
+tests/               guard tests (core purity, admin quarantine)
 ```
 
 ## The trust boundary (RLS)
@@ -65,27 +71,61 @@ so Phase 4 knows which one is the answer; each is editable only by its author.
 
 See `supabase/migrations/0001_init.sql`.
 
+## The capture proxy
+
+`/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI + any
+OpenAI-compatible upstream) are drop-in: point your SDK's base URL at
+`…/v1` and use a HAYEK key. The proxy (edge runtime) forwards the call,
+returns the provider response **byte-identical**, and captures a Trace.
+
+- **Streaming is tee'd** — the client gets tokens with zero added latency; we
+  reassemble the full output only after the stream closes (`src/app/api/v1/_lib/proxy.ts`).
+- **Capture never breaks the call** — every persist path is wrapped and
+  swallowed; a DB outage still returns the provider's bytes and status.
+- **Errors are captured too** — a 429 or content-filter refusal lands as a
+  Trace with its status and body.
+- **Org resolves only from `sha256(key)`** → a non-revoked `api_keys` row.
+  Provider specifics live only in `/src/adapters`.
+
 ## Develop
 
 ```bash
 npm install
-npm test            # 14 tests: core purity guard, cost/schema, sdk
+npm test             # 35 tests incl. the two guards + proxy integration
 npm run typecheck
 npm run build
 
-# database (requires the Supabase CLI)
-supabase start
-supabase db reset   # applies supabase/migrations/*
+# local stack (Supabase CLI is a dev dependency)
+npx supabase start   # Postgres + Auth
+npx supabase db reset               # applies supabase/migrations/*
+psql "$DB_URL" -f supabase/tests/rls_boundary.sql   # 12 RLS assertions
 ```
 
 Copy `.env.example` → `.env.local` and fill in the Supabase keys. The
-service-role key is used **only** by the capture proxy (Phase 1); never expose
-it to the browser.
+service-role key is used **only** by the quarantined proxy (`src/server/admin.ts`);
+never expose it to the browser.
 
-## Demo path (Phase 0)
+## Demo path (Phase 1) — the whole loop in one curl
 
-1. `npm test` — 14 green, including the purity guard.
-2. Add an import of `next`/`react`/`@supabase/*` anywhere under `src/core/` and
-   re-run: the guard turns that file red. Remove it: green again.
-3. `npm run build` — compiles; the placeholder landing renders the five-step loop.
-4. Read `supabase/migrations/0001_init.sql` — the schema and every RLS policy.
+Two helper processes back the demo without a paid provider:
+
+```bash
+node scripts/mock-upstream.mjs   # a mock LLM (OpenAI + Anthropic, streaming)
+node scripts/seed-demo.mjs       # demo org + login + API key + upstream
+npm run dev
+```
+
+`seed-demo` prints a login (`demo@hayek.test` / `hayekdemo123`) and an API key.
+Point the proxy at the mock and watch a trace appear:
+
+```bash
+# a real completion comes back, byte-identical...
+curl -N http://localhost:3000/api/v1/chat/completions \
+  -H "authorization: Bearer hyk_live_demokey_0000000000000000" \
+  -H "content-type: application/json" \
+  -d '{"model":"mock-gpt","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+Then open the app: **TRACES** shows the captured call, **INBOX** puts the model
+output beside an editable pane — edit, ⌘↵ to save, and the dashboard's
+"Knowledge retained" counter ticks up. That correction is the gold.

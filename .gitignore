@@ -27,3 +27,6 @@ next-env.d.ts
 *.pem
 *.tsbuildinfo
 .vercel
+
+# local demo scratch (screenshots, scratch sql)
+/scratch
